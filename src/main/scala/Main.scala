@@ -4,8 +4,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.apache.spark.{SparkConf, SparkContext}
-import scala.collection.mutable
+import org.apache.spark.{Partitioner, SparkConf, SparkContext}
+import scala.collection.{GenTraversableOnce, mutable}
 import scala.math.Ordering.Implicits._
 
 object Main {
@@ -13,36 +13,22 @@ object Main {
   val ApplicationName = "NYC Taxi App"
   val EarthRadius = 6371000.0  // meters
 
-  case class Location(lat: Double, lng: Double) {
-    require(lat >= -90.0 && lat <= 90.0)
-    require(lng >= -180.0 && lng <= 180.0)
-  }
-
-  sealed abstract class Transfer {
-    val time: Instant
-    val location: Location
-  }
-  case class Pickup(time: Instant, location: Location) extends Transfer
-  case class Dropoff(time: Instant, location: Location) extends Transfer
-
-  case class Trip(
-       pickup: Pickup,
-       dropoff: Dropoff,
-       passengers: Int,
-       distance: Double
-   )
-
   // A half-open time interval
   case class Interval(begin: Instant, end: Instant) {
-    require(end.isAfter(begin))
+    require(!end.isBefore(begin), s"$end is before $begin")
     def contains(instant: Instant) = begin <= instant && instant < end
   }
   object Interval {
     def apply(begin: Instant, duration: Duration): Interval = Interval(begin, begin.plus(duration))
   }
 
+  case class Location(lat: Double, lng: Double) {
+    require(lat >= -90.0 && lat <= 90.0, s"invalid latitude: $lat")
+    require(lng >= -180.0 && lng <= 180.0, s"invalid longitude: $lng")
+  }
+
   case class Area(lowerCorner: Location, upperCorner: Location) {
-    require(lowerCorner.lat <= upperCorner.lat && lowerCorner.lng <= upperCorner.lng)
+    require(lowerCorner.lat <= upperCorner.lat && lowerCorner.lng <= upperCorner.lng, s"invalid corners: lower: $lowerCorner, upper: $upperCorner")
     def contains(location: Location) =
       (location.lat >= lowerCorner.lat && location.lng >= lowerCorner.lng) &&
       (location.lat <= upperCorner.lat && location.lng <= upperCorner.lng)
@@ -52,6 +38,16 @@ object Main {
       Location(center.lat - delta, center.lng - delta),
       Location(center.lat + delta, center.lng + delta)
     )
+  }
+
+  // Thanks: http://www.movable-type.co.uk/scripts/latlong.html
+  def distanceBetween(l1: Location, l2: Location): Double = {
+    val φ1 = l1.lat.toRadians
+    val φ2 = l2.lat.toRadians
+    val Δλ = Math.abs(l2.lng - l1.lng).toRadians
+    val R = 6371000.0
+
+    Math.acos( Math.sin(φ1) * Math.sin(φ2) + Math.cos(φ1) * Math.cos(φ2) * Math.cos(Δλ) ) * EarthRadius
   }
 
   object IteratorOps {
@@ -64,79 +60,141 @@ object Main {
   }
 
 
-  case class PickupSearchTolerance(duration: Duration, distance: Double) {
-    require(!duration.isNegative)
-    require(distance > 0.0)
+  sealed abstract class Transfer {
+    val time: Instant
+    val location: Location
+  }
+  case class Pickup(time: Instant, location: Location) extends Transfer
+  case class Dropoff(time: Instant, location: Location) extends Transfer
 
-    val deltaLatLng = (distance / EarthRadius).toDegrees
+  case class Trip(pickup: Pickup, dropoff: Dropoff, passengers: Int, distance: Double)
+
+  case class TransferTolerance(duration: Duration, distance: Double) {
+    require(!duration.isNegative, s"invalid duration: $duration")
+    require(distance > 0.0, s"invalid distance: $distance")
+
+    val locationDelta = (distance / EarthRadius).toDegrees
   }
 
-  case class TripLink(from: Trip, to: Trip)
+  case class LinkingWindow(interval: Interval, area: Area) {
+    def matches(instant: Instant) = interval.contains(instant)
+    def matches(location: Location) = area.contains(location)
+  }
+  object LinkingWindow {
+    def apply(transfer: Transfer, tolerance: TransferTolerance): LinkingWindow =
+      LinkingWindow(
+        Interval(transfer.time, tolerance.duration),
+        Area(transfer.location, tolerance.locationDelta))
+  }
 
-  class PickupSearchZipIterator(dropoffTrips: Iterator[Trip], pickupTrips: Iterator[Trip], tolerance: PickupSearchTolerance) extends Iterator[TripLink] {
-    import IteratorOps._
+  case class TripLinkingWindow(trip: Trip, window: LinkingWindow)
 
-    case class PickupMatcher(trip: Trip) {
-      val interval = Interval(trip.dropoff.time, tolerance.duration)
-      val area = Area(trip.dropoff.location, tolerance.deltaLatLng)
+  case class LinkedTrips(from: Trip, to: Trip)
 
-      def matches(instant: Instant) = interval.contains(instant)
-      def matches(location: Location) = area.contains(location)
+
+  def linkTrips(trips: RDD[Trip], tolerance: TransferTolerance): RDD[LinkedTrips] = {
+
+    // Sort trips by dropoff time
+    val sortedByDropoff = trips.sortBy(_.dropoff.time)
+
+    // Sort trips by pickup time
+    val sortedByPickup = trips.map(trip => (trip.pickup.time, trip)).sortByKey()
+
+    // Calculate linking windows
+    val linkingWindows = sortedByDropoff.map(trip => TripLinkingWindow(trip, LinkingWindow(trip.dropoff, tolerance)))
+
+    // Calculate the time bounds (max interval) for each linking window partition
+    val partitionIntervals = linkingWindows.mapPartitionsWithIndex { (index, windows) =>
+        windows.foldLeft(Option.empty[Interval]) { case (interval, linking) =>
+          interval.map(interval => Interval(interval.begin, linking.window.interval.end))
+            .orElse(Some(linking.window.interval))
+        }
+        .map(interval => Iterator.single((index, interval))).getOrElse(Iterator.empty)
+    }.collect()
+
+    println(s"partition intervals: ${partitionIntervals.mkString(", ")}")
+
+    val partitionCount = partitionIntervals.size
+
+    // Select the range of candidate pickups for each linking window partition
+    val candidatePickups = partitionIntervals
+      .map { case (partition, interval) =>
+        sortedByPickup.filterByRange(interval.begin, interval.end).map { case (time, trip) =>
+          ((partition, time), trip)
+        }
+      }
+      .reduceLeft(_ ++ _)
+      .repartitionAndSortWithinPartitions(new Partitioner {
+        override def numPartitions: Int = partitionCount
+        override def getPartition(key: Any): Int = key match {
+          case (partition: Int, _) => partition
+        }
+      })
+      .map { case ((partition, time), trip) => trip }
+
+    val candidateCount = candidatePickups.count()
+    println(s"candidate count: $candidateCount")
+
+    // Link trips by selectively zipping dropoff trips with pickup trips via linking window
+    val linkedTrips = linkingWindows.zipPartitions(candidatePickups, false) { (linkingWindows, candidatePickups) =>
+      new TripLinkingZipIterator(linkingWindows, candidatePickups)
     }
 
-    val matchers = mutable.Queue.empty[PickupMatcher]
-    val matches = mutable.Queue.empty[TripLink]
-    var nextMatcher = dropoffTrips.nextOption.map(trip => PickupMatcher(trip))
+    linkedTrips
+  }
+
+
+  class TripLinkingZipIterator(sortedLinkingWindows: Iterator[TripLinkingWindow], sortedCandidatePickups: Iterator[Trip]) extends Iterator[LinkedTrips] {
+    import IteratorOps._
+
+    val active = mutable.Queue.empty[TripLinkingWindow]
+    val matches = mutable.Queue.empty[LinkedTrips]
+    var nextWindow = sortedLinkingWindows.nextOption
 
     // Initialize matches
     nextMatches()
 
     override def hasNext: Boolean = !matches.isEmpty
 
-    override def next(): TripLink = {
-      val tripLink = matches.dequeue()
+    override def next(): LinkedTrips = {
+      val linked = matches.dequeue()
       if (matches.isEmpty) nextMatches()
-      tripLink
+      linked
     }
 
     private def nextMatches() = {
 
       assert(matches.isEmpty)
 
-      while (matches.isEmpty && pickupTrips.hasNext && nextMatcher.isDefined) {
-        val pickupTrip = pickupTrips.next()
+      while (matches.isEmpty && sortedCandidatePickups.hasNext && nextWindow.isDefined) {
+        val pickupTrip = sortedCandidatePickups.next()
+        val pickupTime = pickupTrip.pickup.time
 
-        // Purge expired matchers
-        while (matchers.headOption.map(_.interval.end <= pickupTrip.pickup.time).getOrElse(false)) {
-          matchers.dequeue()
+        // Purge expired windows
+        while (active.headOption.map(_.window.interval.end <= pickupTime).getOrElse(false)) {
+          active.dequeue()
         }
 
-        // Skip invalid next matcher(s)
-        while (nextMatcher.map(_.interval.end <= pickupTrip.pickup.time).getOrElse(false)) {
-          nextMatcher = dropoffTrips.nextOption.map(trip => PickupMatcher(trip))
+        // Skip non matching next window(s)
+        while (nextWindow.map(_.window.interval.end <= pickupTime).getOrElse(false)) {
+          nextWindow = sortedLinkingWindows.nextOption
         }
 
-        // Queue newly valid matcher(s)
-        while (nextMatcher.map(_.matches(pickupTrip.pickup.time)).getOrElse(false)) {
-          nextMatcher = nextMatcher.flatMap { m =>
-            matchers.enqueue(m)
-            dropoffTrips.nextOption.map(trip => PickupMatcher(trip))
+        // Queue newly valid window(s)
+        while (nextWindow.map(_.window.matches(pickupTime)).getOrElse(false)) {
+          nextWindow = nextWindow.flatMap { window =>
+            active.enqueue(window)
+            sortedLinkingWindows.nextOption
           }
         }
 
-        matches ++= matchers.filter(_.matches(pickupTrip.pickup.location)).map(m => TripLink(m.trip, pickupTrip))
+        matches ++= active.filter(_.window.matches(pickupTrip.pickup.location)).map { window =>
+          LinkedTrips(window.trip, pickupTrip)
+        }
       }
     }
   }
 
-  def distanceBetween(l1: Location, l2: Location): Double = {
-    val φ1 = l1.lat.toRadians
-    val φ2 = l2.lat.toRadians
-    val Δλ = Math.abs(l2.lng - l1.lng).toRadians
-    val R = 6371000.0
-
-    Math.acos( Math.sin(φ1) * Math.sin(φ2) + Math.cos(φ1) * Math.cos(φ2) * Math.cos(Δλ) ) * EarthRadius
-  }
 
   def loadData(file: String)(implicit sqlContext: SQLContext): DataFrame =
     sqlContext.read
@@ -164,35 +222,31 @@ object Main {
     val schema = dataFrame.schema
     dataFrame.map { row =>
       val pickupTime = row.getTimestamp(schema.fieldIndex("tpep_pickup_datetime")).toInstant
-      val pickupLoc = Location(row.getDouble(schema.fieldIndex("pickup_latitude")), row.getDouble(schema.fieldIndex("pickup_longitude")))
+      val pickupLocation = Location(row.getDouble(schema.fieldIndex("pickup_latitude")), row.getDouble(schema.fieldIndex("pickup_longitude")))
       val dropoffTime = row.getTimestamp(schema.fieldIndex("tpep_dropoff_datetime")).toInstant
-      val dropoffLoc = Location(row.getDouble(schema.fieldIndex("dropoff_latitude")), row.getDouble(schema.fieldIndex("dropoff_longitude")))
+      val dropoffLocation = Location(row.getDouble(schema.fieldIndex("dropoff_latitude")), row.getDouble(schema.fieldIndex("dropoff_longitude")))
       val passengers = row.getInt(schema.fieldIndex("passenger_count"))
       val distance = row.getDouble(schema.fieldIndex("trip_distance"))
 
-      Trip(Pickup(pickupTime, pickupLoc), Dropoff(dropoffTime, dropoffLoc), passengers, distance)
+      Trip(Pickup(pickupTime, pickupLocation), Dropoff(dropoffTime, dropoffLocation), passengers, distance)
     }
   }
-
-  def addColumns(dataFrame: DataFrame) = dataFrame
-    .withColumn("tpep_pickup_date", to_date(dataFrame("tpep_pickup_datetime")))
-    .withColumn("tpep_dropoff_date", to_date(dataFrame("tpep_dropoff_datetime")))
-    .withColumn("tpep_pickup_unix", unix_timestamp(dataFrame("tpep_pickup_datetime")))
-    .withColumn("tpep_dropoff_unix", unix_timestamp(dataFrame("tpep_dropoff_datetime")))
-
 
 
   def main (args: Array[String]){
 
-    val dataFile = "data/yellow_tripdata_2015-01-06-first1MM.csv"
-//    val dataFile = "data/yellow_tripdata_2015-01-06-first200K.csv"
+    val FullDataFile = "data/yellow_tripdata_2015-01-06.csv"
+    val First200K = "data/yellow_tripdata_2015-01-06-first200K.csv"
+    val First1MM = "data/yellow_tripdata_2015-01-06-first1MM.csv"
+
+    val dataFile = FullDataFile
 
     val conf = new SparkConf().setAppName(ApplicationName).setMaster("local[4]")
     val sc = new SparkContext(conf)
     implicit val sqlContext = new SQLContext(sc)
 
-    println("Reading data file...")
-    val trips = mapData(filterData(adjustSchema(loadData(dataFile))))
+    println("Reading and mapping data file...")
+    val trips = mapData(filterData(adjustSchema(loadData(dataFile)))).cache()
 
     println("Calculating trip count...")
     val tripCount = trips.count
@@ -209,33 +263,38 @@ object Main {
 //    pickupSorted.show(10, false)
 //
 
-    println("Sorting by dropoff time...")
-    val dropoffSorted = trips.sortBy(_.dropoff.time).cache()
+//    println("Sorting by dropoff time...")
+//    val dropoffSorted = trips.sortBy(_.dropoff.time).cache()
+//
+//    dropoffSorted.take(100).foreach(println)
+//
+//    println("Sorting by pickup time...")
+//    val pickupSorted = dropoffSorted.sortBy(_.pickup.time).cache()
+//
+//    pickupSorted.take(100).foreach(println)
+//
+//    val dropoffFile = dataFile.replace(".csv", "-dropoff")
+//
+//    println(s"Dropoff sorted partition count: ${pickupSorted.partitions.length}")
+//    println(s"Pickup sorted partition count: ${dropoffSorted.partitions.length}")
+//
+//    val searchTolerance = PickupSearchTolerance(Duration.ofMinutes(1), 50.0)
+//
+//    val dropoffSortedSingle = dropoffSorted.coalesce(1, true)
+//    val pickupSortedSingle = pickupSorted.coalesce(1, true)
+//
+//    println("Calculating zipped trips...")
+//    val zipped = dropoffSortedSingle.zipPartitions(pickupSortedSingle) { (dropoffTrips, pickupTrips) =>
+//      new PickupSearchZipIterator(dropoffTrips, pickupTrips, searchTolerance)
+//    }
+//
+//    val zippedCount = zipped.count()
+//    println(s"Zipped count: $zippedCount")
 
-    dropoffSorted.take(100).foreach(println)
 
-    println("Sorting by pickup time...")
-    val pickupSorted = dropoffSorted.sortBy(_.pickup.time).cache()
-
-    pickupSorted.take(100).foreach(println)
-
-    val dropoffFile = dataFile.replace(".csv", "-dropoff")
-
-    println(s"Dropoff sorted partition count: ${pickupSorted.partitions.length}")
-    println(s"Pickup sorted partition count: ${dropoffSorted.partitions.length}")
-
-    val searchTolerance = PickupSearchTolerance(Duration.ofMinutes(1), 50.0)
-
-    val dropoffSortedSingle = dropoffSorted.coalesce(1, true)
-    val pickupSortedSingle = pickupSorted.coalesce(1, true)
-
-    println("Calculating zipped trips...")
-    val zipped = dropoffSortedSingle.zipPartitions(pickupSortedSingle) { (dropoffTrips, pickupTrips) =>
-      new PickupSearchZipIterator(dropoffTrips, pickupTrips, searchTolerance)
-    }
-
-    val zippedCount = zipped.count()
-    println(s"Zipped count: $zippedCount")
+    println("Linking trips...")
+    val tolerance = TransferTolerance(Duration.ofMinutes(1), 50.0)
+    val links = linkTrips(trips, tolerance)
 
     case class Diff(duration: Duration, distance: Double) {
       def this(dropoff: Trip, pickup: Trip) = this(
@@ -243,7 +302,10 @@ object Main {
         distanceBetween(dropoff.dropoff.location, pickup.pickup.location))
     }
 
-    zipped.take(100).foreach(tl => println(new Diff(tl.from, tl.to)))
+    links.take(100).foreach(link => println(new Diff(link.from, link.to)))
+
+    val linkCount = links.count()
+    println(s"Link count: $linkCount")
 
 //    println("Writing dropoff sorted file...")
 //    dropoffSorted.coalesce(1).write
