@@ -202,12 +202,18 @@ object Main {
       .option("header", "true") // Use first line of all files as header
       .option("inferSchema", "true") // Automatically infer data types
       .load(file)
+  
+  def isValidLatitude(column: Column): Column = column >= -90.0 && column <= 90.0
+  def isValidLongitude(column: Column): Column = column >= -180.0 && column <= 180.0
 
   def filterData(dataFrame: DataFrame) = dataFrame.filter(
     (dataFrame("trip_distance") > 0.0) and
-      (dataFrame("pickup_latitude") !== 0.0) and (dataFrame("pickup_longitude") !== 0.0) and
-      (dataFrame("dropoff_latitude") !== 0.0) and (dataFrame("dropoff_longitude") !== 0.0) and
-      (dataFrame("tpep_pickup_datetime") !== dataFrame("tpep_dropoff_datetime")))
+      (dataFrame("tpep_pickup_datetime") !== dataFrame("tpep_dropoff_datetime")) and
+      isValidLatitude(dataFrame("pickup_latitude")) and
+      isValidLatitude(dataFrame("dropoff_latitude")) and
+      isValidLongitude(dataFrame("pickup_longitude")) and
+      isValidLongitude(dataFrame("dropoff_longitude"))
+  )
 
   // Adjust infered schema (cast timestamp columns)
   def adjustSchema(dataFrame: DataFrame) = dataFrame.columns.foldLeft(dataFrame) { case (dataFrame, name) =>
