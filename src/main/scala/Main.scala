@@ -4,6 +4,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.{Partitioner, SparkConf, SparkContext}
 import scala.collection.{GenTraversableOnce, mutable}
 import scala.math.Ordering.Implicits._
@@ -98,10 +99,15 @@ object Main {
     val sortedByDropoff = trips.sortBy(_.dropoff.time)
 
     // Sort trips by pickup time
-    val sortedByPickup = trips.map(trip => (trip.pickup.time, trip)).sortByKey()
+    val sortedByPickup = trips.map(trip => (trip.pickup.time, trip)).sortByKey().persist(StorageLevel.MEMORY_AND_DISK_SER)
 
     // Calculate linking windows
-    val linkingWindows = sortedByDropoff.map(trip => TripLinkingWindow(trip, LinkingWindow(trip.dropoff, tolerance)))
+    val linkingWindows = sortedByDropoff.map(trip => TripLinkingWindow(trip, LinkingWindow(trip.dropoff, tolerance))).persist(StorageLevel.MEMORY_AND_DISK_SER)
+
+    // Release trips from cache to free memory
+    // TOOD: Move this elsewhere
+    println("Unpersisting trips...")
+    trips.unpersist()
 
     // Calculate the time bounds (max interval) for each linking window partition
     val partitionIntervals = linkingWindows.mapPartitionsWithIndex { (index, windows) =>
@@ -131,6 +137,10 @@ object Main {
         }
       })
       .map { case ((partition, time), trip) => trip }
+      .persist(StorageLevel.MEMORY_AND_DISK_SER)
+
+    println("Unpersisting trips sorted by pickup time...")
+    sortedByPickup.unpersist()
 
     val candidateCount = candidatePickups.count()
     println(s"candidate count: $candidateCount")
@@ -245,14 +255,14 @@ object Main {
     val First200K = "data/yellow_tripdata_2015-01-06-first200K.csv"
     val First1MM = "data/yellow_tripdata_2015-01-06-first1MM.csv"
 
-    val dataFile = FullDataFile
+    val dataFile = First1MM
 
     val conf = new SparkConf().setAppName(ApplicationName).setMaster("local[4]")
     val sc = new SparkContext(conf)
     implicit val sqlContext = new SQLContext(sc)
 
     println("Reading and mapping data file...")
-    val trips = mapData(filterData(adjustSchema(loadData(dataFile)))).cache()
+    val trips = mapData(filterData(adjustSchema(loadData(dataFile)))).persist(StorageLevel.MEMORY_AND_DISK_SER)
 
     println("Calculating trip count...")
     val tripCount = trips.count
@@ -312,6 +322,9 @@ object Main {
 
     val linkCount = links.count()
     println(s"Link count: $linkCount")
+
+    println("Processing complete, hit any key to exit...")
+    System.in.read()
 
 //    println("Writing dropoff sorted file...")
 //    dropoffSorted.coalesce(1).write
