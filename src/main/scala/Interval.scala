@@ -1,5 +1,6 @@
 import java.time.{Duration, Instant}
-import math.Ordering.Implicits._
+
+import scala.math.Ordering.Implicits._
 
 
 // A half-open time interval

@@ -1,6 +1,6 @@
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Column, DataFrame, SQLContext}
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.{Column, DataFrame, SQLContext}
 
 object TripCsv {
 
